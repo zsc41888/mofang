@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, viewport-fit=cover">
+    <title>zsc丨 3D 魔方 Pro</title>
+    <style>
+        /* --- 基础样式 --- */
+        body { 
+            margin: 0; overflow: hidden; background-color: #121212; 
+            font-family: 'DIN Alternate', 'Roboto', sans-serif;
+            -webkit-tap-highlight-color: transparent; touch-action: none; color: white;
+        }
+        #canvas-container { width: 100vw; height: 100vh; display: block; cursor: grab; z-index: 1; }
+        #canvas-container:active { cursor: grabbing; }
+
+        /* --- 顶部 HUD --- */
+        #top-bar {
+            position: absolute; top: 0; left: 0; width: 100%;
+            padding: 15px 20px; box-sizing: border-box;
+            display: flex; justify-content: space-between; align-items: center;
+            pointer-events: none; z-index: 10;
+            background: linear-gradient(to bottom, rgba(0,0,0,0.6) 0%, transparent 100%);
+        }
+        .stat-box { display: flex; flex-direction: column; align-items: center; text-shadow: 0 2px 4px rgba(0,0,0,0.5); }
+        .stat-label { font-size: 10px; opacity: 0.7; letter-spacing: 1px; margin-bottom: 2px; }
+        .stat-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        #timer { color: #4db8ff; }
+        #moves { color: #ffb84d; }
+
+        /* --- 胜利提示 --- */
+        #win-overlay {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%) scale(0.5);
+            font-size: 40px; font-weight: 900; color: #FFD700;
+            text-shadow: 0 0 20px rgba(255, 215, 0, 0.5);
+            pointer-events: none; opacity: 0; z-index: 20;
+            transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        #win-overlay.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+
+        /* --- 底部控制栏 --- */
+        #bottom-bar {
+            position: absolute; bottom: 30px; left: 0; width: 100%;
+            display: flex; justify-content: center; gap: 20px;
+            pointer-events: none; z-index: 10;
+            padding-bottom: env(safe-area-inset-bottom);
+        }
+        .btn {
+            pointer-events: auto; background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2); color: white;
+            width: 50px; height: 50px; border-radius: 50%;
+            display: flex; justify-content: center; align-items: center;
+            font-size: 20px; cursor: pointer;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            transition: transform 0.1s;
+        }
+        .btn:active { transform: scale(0.9); background: rgba(255,255,255,0.25); }
+        .btn.main { width: auto; padding: 0 25px; border-radius: 25px; font-size: 14px; font-weight: bold; letter-spacing: 1px; }
+
+        /* 引导文字 */
+        #guide {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: rgba(255,255,255,0.3); font-size: 14px; pointer-events: none; text-align: center;
+            transition: opacity 0.5s;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tween.js/18.6.4/tween.umd.js"></script>
+</head>
+<body>
+
+    <div id="top-bar">
+        <div class="stat-box">
+            <span class="stat-label">TIME</span>
+            <span class="stat-value" id="timer">00:00.00</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-label">MOVES</span>
+            <span class="stat-value" id="moves">0</span>
+        </div>
+    </div>
+
+    <div id="guide">拖拽旋转视角<br>滑动魔方操作</div>
+    <div id="win-overlay">SOLVED!</div>
+
+    <div id="bottom-bar">
+        <button class="btn" onclick="undoMove()">↩️</button>
+        <button class="btn main" onclick="scramble()">🎲 打乱</button>
+        <button class="btn" onclick="resetGame()">🔄</button>
+    </div>
+
+    <div id="canvas-container"></div>
+
+<script>
+    // --- 配置 ---
+    const CONFIG = {
+        cubeSize: 1, spacing: 0.02, animSpeed: 250,
+        colors: { base:0x111111, u:0xFFFFFF, d:0xFFD500, f:0x009E60, b:0x0051BA, r:0xC41E3A, l:0xFF5800 }
+    };
+    const TOTAL_SIZE = CONFIG.cubeSize + CONFIG.spacing;
+
+    // --- 全局变量 ---
+    let scene, camera, renderer, controls;
+    let cubes = [];
+    let pivot = new THREE.Object3D();
+    
+    // 状态
+    let isAnimating = false;
+    let isScrambling = false;
+    let isSolved = true;
+    let moveHistory = [];
+    let moveCount = 0;
+    
+    // 计时器
+    let startTime = 0;
+    let timerInterval = null;
+    let isTimerRunning = false;
+
+    // 交互
+    let raycaster = new THREE.Raycaster();
+    let mouse = new THREE.Vector2();
+    let startPoint = null;
+    let selectedCube = null;
+    let selectedNormal = null;
+
+    init();
+    animate();
+
+    function init() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121212);
+        scene.add(pivot);
+
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+        camera.position.set(5, 5, 7);
+        camera.lookAt(0,0,0);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; controls.enablePan = false;
+        controls.minDistance = 3; controls.maxDistance = 15;
+
+        // 灯光
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const dl = new THREE.DirectionalLight(0xffffff, 1);
+        dl.position.set(10, 20, 10); scene.add(dl);
+        const fl = new THREE.DirectionalLight(0xffffff, 0.4);
+        fl.position.set(-10, -10, -10); scene.add(fl);
+
+        createCube();
+
+        const cvs = renderer.domElement;
+        cvs.addEventListener('pointerdown', onPointerDown);
+        cvs.addEventListener('pointermove', onPointerMove);
+        cvs.addEventListener('pointerup', onPointerUp);
+        cvs.addEventListener('pointerleave', onPointerUp);
+        window.addEventListener('resize', onResize);
+    }
+
+    // --- 计时器逻辑 ---
+    function startTimer() {
+        if (isTimerRunning || isSolved) return;
+        isTimerRunning = true;
+        startTime = Date.now();
+        document.getElementById('guide').style.opacity = '0';
+        
+        timerInterval = setInterval(() => {
+            const delta = Date.now() - startTime;
+            const min = Math.floor(delta / 60000).toString().padStart(2, '0');
+            const sec = Math.floor((delta % 60000) / 1000).toString().padStart(2, '0');
+            const ms = Math.floor((delta % 1000) / 10).toString().padStart(2, '0');
+            document.getElementById('timer').innerText = `${min}:${sec}.${ms}`;
+        }, 30);
+    }
+
+    function stopTimer() {
+        isTimerRunning = false;
+        clearInterval(timerInterval);
+    }
+
+    function resetUI() {
+        stopTimer();
+        document.getElementById('timer').innerText = "00:00.00";
+        document.getElementById('moves').innerText = "0";
+        document.getElementById('win-overlay').classList.remove('show');
+        document.getElementById('guide').style.opacity = '1';
+        moveCount = 0;
+    }
+
+    // --- 核心逻辑 ---
+
+    function createCube() {
+        cubes.forEach(c => scene.remove(c));
+        cubes = [];
+        const geo = new THREE.BoxGeometry(CONFIG.cubeSize, CONFIG.cubeSize, CONFIG.cubeSize);
+        const edgeGeo = new THREE.EdgesGeometry(geo);
+
+        for (let x=-1; x<=1; x++) {
+            for (let y=-1; y<=1; y++) {
+                for (let z=-1; z<=1; z++) {
+                    const mats = [
+                        getMat(x===1?CONFIG.colors.r:CONFIG.colors.base),
+                        getMat(x===-1?CONFIG.colors.l:CONFIG.colors.base),
+                        getMat(y===1?CONFIG.colors.u:CONFIG.colors.base),
+                        getMat(y===-1?CONFIG.colors.d:CONFIG.colors.base),
+                        getMat(z===1?CONFIG.colors.f:CONFIG.colors.base),
+                        getMat(z===-1?CONFIG.colors.b:CONFIG.colors.base),
+                    ];
+                    const cube = new THREE.Mesh(geo, mats);
+                    cube.position.set(x*TOTAL_SIZE, y*TOTAL_SIZE, z*TOTAL_SIZE);
+                    
+                    const edges = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({color:0x000000, linewidth:2}));
+                    cube.add(edges);
+                    scene.add(cube);
+                    cubes.push(cube);
+                }
+            }
+        }
+    }
+
+    function getMat(c) {
+        return new THREE.MeshStandardMaterial({color:c, roughness:0.5, metalness:0.1});
+    }
+
+    // --- 智能判定算法 ---
+    function checkIsSolved() {
+        if (cubes.length === 0) return false;
+        
+        // 核心思路：如果魔方复原了，所有小方块相对于彼此的旋转应该是相同的。
+        // 即：它们组成了一个整体。我们只需要检查所有方块的四元数(Quaternion)是否一致。
+        
+        const q0 = cubes[0].quaternion; // 取第一个方块作为基准
+        const threshold = 0.1; // 允许极小的浮点误差
+
+        for (let i = 1; i < cubes.length; i++) {
+            // angleTo 计算两个旋转之间的角度差，如果大于阈值，说明有方块没对齐
+            if (cubes[i].quaternion.angleTo(q0) > threshold) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function handleWin() {
+        stopTimer();
+        isSolved = true;
+        document.getElementById('win-overlay').classList.add('show');
+        // 简单的胜利动画：让魔方转一圈
+        new TWEEN.Tween(scene.rotation)
+            .to({y: scene.rotation.y + Math.PI * 2}, 1000)
+            .easing(TWEEN.Easing.Cubic.Out)
+            .start();
+    }
+
+    // --- 旋转与动画 ---
+
+    function doRotate(axis, layer, angle, speed, isUserAction) {
+        if (isAnimating) return;
+        isAnimating = true;
+
+        if (isUserAction && !isScrambling) {
+            if (isSolved) { // 如果是从还原状态开始，第一步重置为未还原
+                 isSolved = false;
+                 document.getElementById('win-overlay').classList.remove('show');
+            }
+            startTimer();
+            moveCount++;
+            document.getElementById('moves').innerText = moveCount;
+            moveHistory.push({axis, layer, angle});
+        }
+
+        const group = cubes.filter(c => Math.abs(Math.round(c.position[axis]/TOTAL_SIZE) - layer) < 0.1);
+
+        pivot.rotation.set(0,0,0);
+        pivot.updateMatrixWorld();
+        group.forEach(c => pivot.attach(c));
+
+        new TWEEN.Tween({val:0}).to({val:angle}, speed)
+            .easing(TWEEN.Easing.Quadratic.Out)
+            .onUpdate(o => pivot.rotation[axis] = o.val)
+            .onComplete(() => {
+                pivot.updateMatrixWorld();
+                group.forEach(c => {
+                    scene.attach(c);
+                    c.position.x = Math.round(c.position.x/TOTAL_SIZE)*TOTAL_SIZE;
+                    c.position.y = Math.round(c.position.y/TOTAL_SIZE)*TOTAL_SIZE;
+                    c.position.z = Math.round(c.position.z/TOTAL_SIZE)*TOTAL_SIZE;
+                    c.rotation.x = Math.round(c.rotation.x/(Math.PI/2))*(Math.PI/2);
+                    c.rotation.y = Math.round(c.rotation.y/(Math.PI/2))*(Math.PI/2);
+                    c.rotation.z = Math.round(c.rotation.z/(Math.PI/2))*(Math.PI/2);
+                    c.updateMatrix();
+                });
+                pivot.rotation.set(0,0,0);
+                isAnimating = false;
+
+                // 旋转结束后检查是否还原
+                if (!isScrambling && moveCount > 0 && checkIsSolved()) {
+                    handleWin();
+                }
+            }).start();
+    }
+
+    // --- 交互系统 ---
+    function onPointerDown(e) {
+        if (isAnimating) return;
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left)/rect.width)*2 - 1;
+        mouse.y = -((e.clientY - rect.top)/rect.height)*2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const ints = raycaster.intersectObjects(cubes);
+
+        if (ints.length > 0) {
+            controls.enabled = false;
+            selectedCube = ints[0].object;
+            selectedNormal = ints[0].face.normal.clone().transformDirection(selectedCube.matrixWorld).round();
+            startPoint = {x:e.clientX, y:e.clientY};
+        } else {
+            controls.enabled = true;
+            selectedCube = null;
+        }
+    }
+
+    function onPointerMove(e) {
+        if (!startPoint || !selectedCube || isAnimating) return;
+        const dx = e.clientX - startPoint.x;
+        const dy = e.clientY - startPoint.y;
+        if (Math.sqrt(dx*dx+dy*dy) < 10) return;
+
+        const moveVec = new THREE.Vector2(dx, dy).normalize();
+        const axes = [new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,1)];
+        let bestAxis = null, maxDot = 0, moveDir3D = new THREE.Vector3();
+
+        axes.forEach(ax => {
+            if (Math.abs(ax.dot(selectedNormal)) > 0.9) return;
+            const p1 = project(selectedCube.position);
+            const p2 = project(selectedCube.position.clone().add(ax));
+            const scrDir = new THREE.Vector2(p2.x-p1.x, p2.y-p1.y).normalize();
+            const dot = scrDir.dot(moveVec);
+            if (Math.abs(dot) > Math.abs(maxDot)) {
+                maxDot = dot; bestAxis = ax; moveDir3D = ax.clone().multiplyScalar(Math.sign(dot));
+            }
+        });
+
+        if (bestAxis) {
+            const rotAxis = new THREE.Vector3().crossVectors(selectedNormal, moveDir3D).round();
+            let aName = 'x', dir = 0;
+            if (Math.abs(rotAxis.x)>0.5) { aName='x'; dir=rotAxis.x; }
+            else if (Math.abs(rotAxis.y)>0.5) { aName='y'; dir=rotAxis.y; }
+            else { aName='z'; dir=rotAxis.z; }
+
+            const layer = Math.round(selectedCube.position[aName]/TOTAL_SIZE);
+            doRotate(aName, layer, dir*Math.PI/2, CONFIG.animSpeed, true);
+            startPoint = null; selectedCube = null;
+        }
+    }
+
+    function onPointerUp() { startPoint = null; controls.enabled = true; }
+    function project(v) { const t=v.clone().project(camera); return {x:t.x, y:-t.y}; }
+
+    // --- 按钮功能 ---
+    function undoMove() {
+        if (isAnimating || moveHistory.length===0 || isScrambling || isSolved) return;
+        const last = moveHistory.pop();
+        // 撤销不增加步数，也不重置计时器，但需要反向旋转
+        doRotate(last.axis, last.layer, -last.angle, CONFIG.animSpeed, false); 
+        // 修正步数显示 (可选)
+        // moveCount--; document.getElementById('moves').innerText = moveCount; 
+    }
+
+    function scramble() {
+        if (isAnimating) return;
+        resetUI();
+        isScrambling = true;
+        isSolved = false; // 标记为未还原
+        moveHistory = [];
+        
+        const axes = ['x','y','z']; const layers = [-1,0,1]; const dirs = [1,-1];
+        let count = 0;
+        
+        function step() {
+            if (count >= 20) { 
+                isScrambling = false; 
+                return; 
+            }
+            const ax = axes[Math.floor(Math.random()*3)];
+            const la = layers[Math.floor(Math.random()*3)];
+            const di = dirs[Math.floor(Math.random()*2)];
+            doRotate(ax, la, di*Math.PI/2, 60, false); // false = 不记录历史/不开始计时
+            setTimeout(() => { count++; step(); }, 70);
+        }
+        step();
+    }
+
+    function resetGame() {
+        if (isAnimating) return;
+        resetUI();
+        isSolved = true;
+        moveHistory = [];
+        createCube();
+        new TWEEN.Tween(camera.position).to({x:5,y:5,z:7}, 1000).easing(TWEEN.Easing.Cubic.Out).start();
+        new TWEEN.Tween(controls.target).to({x:0,y:0,z:0}, 1000).start();
+        new TWEEN.Tween(scene.rotation).to({x:0,y:0,z:0}, 1000).start();
+    }
+
+    function onResize() {
+        camera.aspect = window.innerWidth/window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function animate(t) {
+        requestAnimationFrame(animate);
+        TWEEN.update(t);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+</script>
+</body>
+</html>
